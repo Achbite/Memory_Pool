@@ -311,7 +311,7 @@ public:
         for (auto page : pages_) {
             page->active_count = page->capacity; // 默认全满
         }
-
+        // 遍历全局空闲链表，标记空闲节点所属的 Page
         FreeNode* curr = free_list_;
         while (curr) {
             // 二分查找定位所属 Page
@@ -351,7 +351,8 @@ public:
 
         // 3. 重建空闲链表 (Rebuild FreeList)
         FreeNode* new_free_list = nullptr;
-        FreeNode** tail_ptr = &new_free_list; 
+        // 遍历旧链表，剔除将被释放页的节点
+        FreeNode** tail_ptr = &new_free_list;  
 
         curr = free_list_;
         while (curr) {
