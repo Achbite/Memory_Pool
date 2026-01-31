@@ -1,86 +1,64 @@
-# C++ High Performance Memory Pool
+# High Performance Memory Pool
 
-一个轻量级、线程安全且高性能的 C++ 固定大小对象内存池实现。专为游戏开发（如子弹、粒子系统）或高频小对象分配场景设计。
+一个基于 C++11 实现的高性能内存池，专为高频分配/释放固定大小对象的场景（如游戏中的子弹、粒子系统）设计。
 
-## ✨ 特性 (Features)
+## 项目结构
 
-*   **⚡ 高性能 (High Performance)**:
-    *   **侵入式空闲链表 (Intrusive FreeList)**: 无需额外内存开销来维护空闲块，将空闲对象的内存复用为链表节点。
-    *   **内存大页管理 (Page Management)**: 批量申请大块内存（Page），减少 `malloc`/`new` 的系统调用次数，降低堆碎片。
-    *   **内存对齐 (Aligned Allocation)**: 自动处理内存对齐（支持 `posix_memalign` 和 Windows `_aligned_malloc`），对 SIMD 优化友好。
-*   **🛡️ 线程安全 (Thread Safety)**: 内置 `std::mutex` 互斥保护，支持多线程并发访问。
-*   **📈 动态伸缩 (Dynamic Scaling)**:
-    *   **自动扩容**: 内存不足时自动申请新的 Page。
-    *   **智能收缩 (Adaptive Shrinking)**: 引入类“强化学习”的峰值追踪算法。系统会记录长期使用的峰值水位，当检测到长时间空闲且实际用量远低于水位时，自动触发垃圾回收 (GC) 并释放内存归还给操作系统。
-*   **🔒 安全可靠 (Safety)**:
-    *   **RAII**: 利用构造/析构函数管理生命周期，禁用拷贝防止双重释放。
-    *   **异常安全**: 扩容逻辑使用 `std::unique_ptr` 保护，防止扩容失败时的内存泄漏。
-    *   **边界检查**: 提供 `contains()` 方法辅助调试，验证指针合法性。
-
-## 🛠️ 构建 (Build)
-
-本项目支持 Windows (MinGW) 和 Linux 环境。需要支持 C++11 或更高版本的编译器。
-
-### Windows (使用脚本)
-直接运行提供的批处理脚本：
-```cmd
-.\build.bat
+```
+Memory_Pool/
+├── include/
+│   └── MemoryPool.hpp   # 核心实现：内存池模板类、页管理、分配器
+├── src/
+│   └── main.cpp         # 仿真程序：多线程模拟、命令行交互
+├── build.bat            # Windows 构建脚本
+├── Makefile             # 通用构建脚本
+└── README.md            # 项目文档
 ```
 
-### 通用 (使用 Make)
-```bash
+## 核心特性与优化策略
+
+### 1. 核心架构：分页管理 (Paging)
+- **原理**：不直接向操作系统申请零散的小内存，而是以 **Page (页)** 为单位申请大块内存（如 1024 个对象一块）。
+- **优势**：减少系统调用 (`malloc`/`new`) 的开销，降低内存碎片。
+- **实现**：`std::vector<Page*> pages_` 管理所有内存页，支持动态扩容。
+
+### 2. 极致性能：线程局部缓存 (TLAB)
+- **痛点**：多线程环境下，全局唯一的内存池会成为锁竞争的瓶颈。
+- **优化**：引入 **Thread-Local Allocation Buffer (TLAB)**。
+    - **分配**：每个线程维护一个私有的 `FreeList`，分配时不加锁。仅当私有缓存耗尽时，才加锁从全局池“批发”一批节点。
+    - **释放**：释放时优先还会私有缓存。仅当缓存过大时，才加锁批量归还给全局池。
+- **效果**：将 99% 的操作转化为无锁的指针操作，极大地提升了并发吞吐量。
+
+### 3. 使用便捷：侵入式链表 (Intrusive List)
+- **原理**：利用空闲对象的内存空间存储指向下一个空闲对象的指针 (`FreeNode`)。
+- **优势**：不需要额外的内存来维护空闲链表，空间利用率高。
+
+### 4. 健壮性：自动收缩 (GC) 与 自动对齐
+- **GC 机制**：结合引用计数与二分查找，识别完全空闲的 Page 并返还给操作系统。
+    - **自适应**：基于“强化学习”思想，通过长期峰值监测 (`long_term_peak_`) 和施密特触发器原理，智能决定何时缩容，避免频繁内存抖动。
+- **内存对齐**：封装 `AlignedAllocator`，自动处理不同平台 (Windows/POSIX) 的内存对齐要求，确保证 SIMD 指令集兼容性。
+
+## 快速开始
+
+### 编译
+Windows (MinGW):
+```cmd
 make
 ```
+或直接运行 `build.bat`。
 
-### 使用 CMake
-```bash
-mkdir build
-cd build
-cmake ..
-cmake --build .
+### 运行仿真
+```cmd
+MemoryPool.exe
 ```
 
-## 🚀 快速开始 (Usage)
+### 交互指令
+程序启动后进入命令行交互模式：
+- `<ThreadID> <Count>`: 指定线程发射多少发子弹。 例如 `1 10000` 表示线程 1 发射 10000 发。
+- `clear`: 强制回收所有活跃子弹，并通知所有线程清空本地缓存。
+- `status`: 查看当前内存池的详细统计信息。
+- `exit`: 退出程序。
 
-只需包含头文件 `include/MemoryPool.hpp` 即可使用。
-
-```cpp
-#include "MemoryPool.hpp"
-
-struct Bullet {
-    int id;
-    double damage;
-    // ...
-};
-
-int main() {
-    // 创建一个管理 Bullet 对象的内存池
-    MemoryPool<Bullet> pool;
-
-    // 1. 分配对象 (类似于 new Bullet(1, 50.0))
-    // allocate 支持任意构造参数
-    Bullet* b1 = pool.allocate(1, 50.0);
-
-    // 2. 使用对象
-    std::cout << "Bullet ID: " << b1->id << std::endl;
-
-    // 3. 回收对象 (类似于 delete b1)
-    pool.deallocate(b1);
-    
-    return 0;
-}
-```
-
-## ⚙️ 核心配置
-
-在 `MemoryPool.hpp` 中可以调整以下常量以适应不同场景：
-
-```cpp
-const size_t INITIAL_SIZE = 5000;      // 初始容量
-const size_t GROW_SIZE = 2000;         // 每次扩容数量
-const size_t MAINTAIN_INTERVAL = 1000; // 触发自动维护（GC）的频率
-```
-
-## 📄 License
-
-MIT License
+## 常见问题
+**Q: 为什么 clear 后 Pool Used 不为 0？**
+A: 这是 TLAB 的特性。为了性能，每个线程会保留一部分空闲节点在本地缓存中。我们在 `clear` 命令中实现了广播机制，会通知所有工作线程执行 `flush`，但由于线程异步执行，统计数据可能会有短暂延迟。再次执行 `status` 即可看到归零。

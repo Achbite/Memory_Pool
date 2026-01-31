@@ -132,6 +132,12 @@ public:
                     tasks_.pop_front();
                 }
 
+                // 特殊任务：-1 代表强制刷新缓存
+                if (alloc_num == -1) {
+                    g_pool.flush_thread_cache();
+                    continue;
+                }
+
                 // 执行任务：模拟发射子弹
                 for (int i = 0; i < alloc_num; ++i) {
                     Bullet* b = g_pool.allocate(id_); // 使用 MemoryPool 的参数转发
@@ -180,7 +186,23 @@ int main() {
 
         if (line == "clear") {
             g_manager.clear_all();
+            
+            // 刷新所有工作线程的本地缓存
+            // 因为工作线程持有私有的 TLAB，简单 clear 只能回收 "Managed" 对象，
+            // 无法触及缓存在每个线程本地 freelist 中的节点。
+            // 我们不能直接操作其他线程的 thread_local 变量，所以必须通知它们自己去做。
+            // 这里通过发送特殊任务代码 -1 来触发 Worker 内部的 flush。
+            for (auto& w : g_workers) {
+                w.second->add_task(-1);
+            }
+            
+            // 刷新主线程缓存
+            g_pool.flush_thread_cache();
+            
             g_pool.reset_round_stats(); // 重置计数器以便观察后续变化
+            
+            // 提示用户异步清理正在进行
+            log("[System] Flush signal sent to all workers. Pool stats will update shortly.");
             continue;
         }
 
@@ -209,6 +231,12 @@ int main() {
             
             // 下发任务
             g_workers[thread_id]->add_task(count);
+        } else if (line == "flush") {
+             // 新增隐藏指令：通知所有线程刷新缓存
+             // 实际上需要更复杂的线程间通信。
+             // 这里仅作为占位，并未真正实现全线程 flush。
+             g_pool.flush_thread_cache();
+             log("[System] Main thread cache flushed.");
         } else {
             log("[Error] Invalid format. Use: <ThreadID> <Count>");
         }

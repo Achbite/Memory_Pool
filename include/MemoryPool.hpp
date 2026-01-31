@@ -53,6 +53,14 @@ struct FreeNode {
     FreeNode* next;
 };
 
+// 线程局部缓存配置
+struct ThreadCache {
+    FreeNode* free_list = nullptr;
+    size_t count = 0;              // 当前缓存的对象数量
+    const size_t BATCH_SIZE = 100; // 批量传输大小
+    const size_t MAX_CACHE = 200;  // 缓存上限，超过则归还一半给全局池
+};
+
 // 内存大页，存放一批对象
 struct Page {
     void* memory;    // 指向原始内存块的指针
@@ -63,7 +71,7 @@ struct Page {
 
     // 构造函数：申请原始内存
     // 修复：初始化列表顺序应与成员声明顺序一致 (size 先于 capacity)
-    Page(size_t cap, size_t obj_size) : capacity(cap) , size(obj_size) {
+    Page(size_t cap, size_t obj_size) : size(obj_size), capacity(cap) {
         // 使用对齐分配器
         // 对齐值通常取 sizeof(void*) 或 CPU cache line 大小 (e.g., 64 bytes)
         // 这里为了保证 T 类型的对齐要求，取 alignof(max_align_t) 或 至少 sizeof(void*)
@@ -109,6 +117,9 @@ private:
     std::atomic<size_t> used_count_{0};
     std::atomic<size_t> alloc_count_{0};
     std::atomic<size_t> free_count_{0};
+
+    // 线程局部缓存
+    static thread_local ThreadCache t_cache_;
 
     const size_t INITIAL_SIZE = 5000;
     const size_t GROW_SIZE = 2000; // 每次动态扩容的数量
@@ -188,6 +199,75 @@ public:
         }
     }
 
+    // 从全局池批量获取节点到线程缓存
+    // 返回获取到的数量
+    size_t fetch_from_global(size_t count) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        
+        // 如果全局池空了，先扩容
+        if (!free_list_) {
+            expand(std::max(count, GROW_SIZE));
+            // std::cout << "[System] Pool Expanded for Thread Cache. Capacity: " << total_capacity_ << "\n";
+        }
+
+        size_t fetched = 0;
+        // 从全局 free_list 搬运节点到线程缓存
+        while (free_list_ && fetched < count) {
+            FreeNode* node = free_list_;
+            free_list_ = node->next; // 摘除
+            
+            // 挂入线程缓存
+            node->next = t_cache_.free_list;
+            t_cache_.free_list = node;
+            
+            fetched++;
+            used_count_++; // 从全局池的角度看，分配给线程缓存就算 "used"
+        }
+        return fetched;
+    }
+
+    // 将线程缓存归还一部分给全局池
+    void return_to_global(size_t count) {
+        if (count == 0 || !t_cache_.free_list) return;
+
+        std::lock_guard<std::mutex> lock(mtx_);
+        
+        size_t returned = 0;
+        // 循环：将链表节点逐一摘下，还给全局 free_list
+        // 这是连接线程私有领域和全局共享领域的关键步骤
+        while (t_cache_.free_list && returned < count) {
+            FreeNode* node = t_cache_.free_list;
+            t_cache_.free_list = node->next; // 摘除
+            
+            // 挂回全局池
+            node->next = free_list_;
+            free_list_ = node;
+            
+            returned++;
+            used_count_--; // 从全局池回收
+        }
+
+        // 触发维护逻辑：当有内存归还时，检查是否需要 GC 收缩
+        // 增加计数器，避免每次归还都触发昂贵的 maintain 操作（涉及浮点运算和可能的锁竞争分析）
+        // MAINTAIN_INTERVAL = 1000，这里取其 1/10，即每归还 ~10 个 batch 后检查一次
+        maintain_ops_counter_++;
+        if (maintain_ops_counter_ >= MAINTAIN_INTERVAL / 10) { 
+            maintain_ops_counter_ = 0;
+            maintain();
+        }
+    }
+
+    // 强制刷新线程缓存，将所有节点归还给全局池
+    // 建议在线程任务结束、帧结束或空闲时调用，以降低看似泄漏的内存占用
+    void flush_thread_cache() {
+        if (!t_cache_.free_list) return;
+        
+        // 全额归还
+        return_to_global(t_cache_.count);
+        t_cache_.count = 0;
+        t_cache_.free_list = nullptr;
+    }
+
     // 类强化学习的动态维护：根据历史峰值调整容量
     void maintain() {
         // 1. 更新观测数据
@@ -211,7 +291,8 @@ public:
         if (target_capacity < min_capacity_) target_capacity = min_capacity_;
 
         // 3. 判断是否需要收缩 (Shrink)
-        // 只有当当前容量显著大于目标容量（例如 1.5 倍）时才触发，避免频繁抖动
+        // 只有当当前容量显著大于目标容量（例如 1.5 倍）时才触发，避免频繁抖动 (Hysteresis)
+        // 施密特触发器原理：上升阈值高，下降阈值低，防止在临界点反复震荡
         if (total_capacity_ > target_capacity * 1.5) {
             shrink(target_capacity);
         }
@@ -282,49 +363,17 @@ public:
         while (curr) {
             FreeNode* next_node = curr->next; // 先保存下一个，因为 curr 可能被跳过
 
-            // 再次查找 curr 属于哪个 Page (为了安全和逻辑统一，虽然稍微耗时)
-            // 优化：我们可以缓存上一次查找的 index，因为 free_list 往往具有局部性？不一定。
-            // 实际上，我们只需要检查 curr 是否在 pages_to_free 中即可。
-            // 但 pages_to_free 也是 vector。
-            // 更快的方法：我们已经在 step 1 知道 node 属于哪个 page 了... 但在那一步我们没法存下来（因为是 intrusive list）。
-            
-            // 重新判定：这也是没办法的事
+            // 再次二分查找 curr 属于哪个 Page
+            // 优化点：这里理论上可以合并到阶段一，但那样需要更复杂的数据结构暂存 node
              auto it = std::upper_bound(pages_.begin(), pages_.end(), curr, 
                 [](const void* addr, const Page* page) {
                     return addr < page->memory;
                 });
             
-            bool should_free = false;
-            if (it != pages_.begin()) {
-                Page* page = *(--it);
-                // 检查这个 page 是否在待释放列表中
-                // 这里可以用一个简单的 flag 在 page 结构体里，避免 vector 查找
-                // 但不能改 Page 结构体太多。
-                // 简单起见，比较地址范围
-                if (page->contains(curr)) {
-                     // 检查该页是否 active_count == 0 且 被选为释放
-                     // 最简单的方法是看 pages_to_keep 里有没有它。
-                     // 为了加速，我们可以在 Page 上打个标记。
-                     // 既然 active_count == 0，那些页就是空的。
-                     // 但我们只释放了一部分空页。
-                     
-                     // 让我们优化一下算法：
-                     // 我们不再遍历 FreeList 来过滤，而是直接遍历 pages_to_keep，
-                     // 把它们所有的空闲部分重新挂载成 FreeList？
-                     // 不行！因为 pages_to_keep 里可能有 "部分使用" 的页，
-                     // 我们不知道哪些节点被使用了，哪些没被使用。
-                     // 唯一的信息源就是当前的 free_list_。
-                     
-                     // 所以必须过滤 free_list_。
-                     // 为了加速 "是否保留" 的判断，我们可以把 pages_to_free 排序（按地址），然后二分查找。
-                     // 实际上 pages_to_free 本身就是按地址排序的（因为 pages_ 是有序的）。
-                }
-            }
-
             // 让我们用更笨但稳健的方法：
             // 判断 curr 是否落在 pages_to_free 的任何一个区间内。
             bool is_garbage = false;
-            // 遍历待释放页 (通常数量很少)
+            // 遍历待释放页 (通常数量很少，性能可接受)
             for (auto p : pages_to_free) {
                 if (p->contains(curr)) {
                     is_garbage = true;
@@ -358,24 +407,24 @@ public:
     // Args&&... args: 变长模板参数，支持任意形式的构造函数参数
     template<typename... Args>
     T* allocate(Args&&... args) {
-        std::lock_guard<std::mutex> lock(mtx_); // 加锁保护 free_list
-        
-        if (!free_list_) {
-            // 如果没有空闲块，进行扩容
-            expand(GROW_SIZE);
-            // std::cout << "[System] Pool Expanded. Current Capacity: " << total_capacity_ << "\n";
+        // 1. 尝试从线程局部缓存分配 (无锁路径)
+        if (!t_cache_.free_list) {
+            // 缓存为空，批量从全局池获取
+            fetch_from_global(t_cache_.BATCH_SIZE);
+            // 如果获取后依然为空（理论上 fetch_from_global 内部会 expand，不会空），则真的无法分配（OOM）
+            if (!t_cache_.free_list) throw std::bad_alloc();
         }
 
-        // 从空闲链表头部取出一个节点
-        FreeNode* node = free_list_;
-        free_list_ = node->next; // 链表头后移
+        // 从线程局部缓存摘取节点
+        FreeNode* node = t_cache_.free_list;
+        t_cache_.free_list = node->next;
+        t_cache_.count--;
         
-        used_count_++;
-        alloc_count_++;
-        
+        alloc_count_++; // 统计总分配数 (atomic)
+
         // --- Placement New ---
         // 这里的语法是 new (address) Type(args...)
-        // 它的作用是：不分配新内存，而是直接在 node 指向的这块现有内存上，
+        // 它的作用是：不分配新内存，而是直接在 node 指向的这块现有内存上,
         // 调用 T 的构造函数。
         // 这是内存池的核心：复用内存，避免反复向操作系统申请。
         return new (node) T(std::forward<Args>(args)...);
@@ -393,22 +442,27 @@ public:
         // 必须手动调用 ~T() 来清理对象内部可能申请的资源。
         ptr->~T();
 
-        std::lock_guard<std::mutex> lock(mtx_);
-        
-        // 2. 将这块内存重新解释为 FreeNode，挂回空闲链表
+        // 2. 归还到线程局部缓存 (无锁路径)
         FreeNode* node = reinterpret_cast<FreeNode*>(ptr);
-        node->next = free_list_; // 头插法回收
-        free_list_ = node;
-
-        used_count_--;
-        free_count_++;
+        node->next = t_cache_.free_list;
+        t_cache_.free_list = node;
+        t_cache_.count++;
         
-        // 3. 触发自动维护
-        // 为了降低开销，不要每次都调用，而是每 N 次操作调用一次
-        if (++maintain_ops_counter_ >= MAINTAIN_INTERVAL) {
-            maintain_ops_counter_ = 0;
-            maintain();
+        free_count_++; // 统计总释放数 (atomic)
+
+        // 3. 检查缓存是否过爆，需要批量归还全局池
+        if (t_cache_.count >= t_cache_.MAX_CACHE) {
+            // 归还一半
+            return_to_global(t_cache_.BATCH_SIZE); 
+            t_cache_.count -= t_cache_.BATCH_SIZE;
         }
+
+        // 维护逻辑：这里稍微有点复杂，因为现在维护是由主线程或者 deallocate 触发的
+        // 以前是每次 deallocate 全局锁去触发。
+        // 现在大部分时间不碰全局锁。
+        // 为了保持 maintain 功能，我们可以在 return_to_global 里做。
+        // 或者简单点：TLAB 模式下，maintain 的频率本身就会降低（只有批量归还时才可能触发），
+        // 我们可以把 maintain 放到 return_to_global 里调用。
     }
 
     // 边界检查：判断指针是否属于该内存池
@@ -445,3 +499,7 @@ public:
         free_count_ = 0;
     }
 };
+
+// 静态成员定义
+template<typename T>
+thread_local ThreadCache MemoryPool<T>::t_cache_;
