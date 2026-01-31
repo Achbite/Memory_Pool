@@ -302,9 +302,6 @@ public:
     // 这是一个相对耗时的操作，不需要太频繁调用
     void shrink(size_t target_capacity) {
         // 必须持有锁，因为要操作 free_list_ 和 pages_
-        // 注意：maintain 应该在 deallocate 内部调用，那里已经有锁了？
-        // 不，maintain 应该被包装，或者在 deallocate 尾部非临界区调用？
-        // 为了安全，我们假设调用者已经持有锁，或者这是一个私有辅助函数。
         // 由于 deallocate 持有锁，我们将其作为私有函数直接执行。
 
         // 1. 统计每个 Page 的空闲节点数
@@ -363,13 +360,6 @@ public:
         while (curr) {
             FreeNode* next_node = curr->next; // 先保存下一个，因为 curr 可能被跳过
 
-            // 再次二分查找 curr 属于哪个 Page
-            // 优化点：这里理论上可以合并到阶段一，但那样需要更复杂的数据结构暂存 node
-             auto it = std::upper_bound(pages_.begin(), pages_.end(), curr, 
-                [](const void* addr, const Page* page) {
-                    return addr < page->memory;
-                });
-            
             // 让我们用更笨但稳健的方法：
             // 判断 curr 是否落在 pages_to_free 的任何一个区间内。
             bool is_garbage = false;
