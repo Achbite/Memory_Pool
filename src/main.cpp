@@ -9,6 +9,9 @@
 #include <map>
 #include <condition_variable>
 
+// 全局调试控制
+std::atomic<bool> g_debug_mode{false};
+
 // 线程安全的打印控制
 std::mutex g_console_mtx;
 void log(const std::string& msg) {
@@ -138,16 +141,54 @@ public:
                     continue;
                 }
 
-                // 执行任务：模拟发射子弹
+                long long ordinary_time_us = 0;
+                long long pure_pool_time_us = 0; // 新增：纯内存池基准
+                long long pool_time_us = 0;
+
+                // Debug模式下：先跑一遍普通分配的基准测试 (模拟)
+                if (g_debug_mode) {
+                    // 1. 基准测试：普通 New/Delete
+                    auto start = std::chrono::high_resolution_clock::now();
+                    for (int i = 0; i < alloc_num; ++i) {
+                        Bullet* b = new Bullet(id_);
+                        delete b; 
+                    }
+                    auto end = std::chrono::high_resolution_clock::now();
+                    ordinary_time_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+                    // 2. 基准测试：纯内存池 Alloc/Dealloc (公平对比)
+                    // 这能反映出剥离掉 g_manager 锁和队列操作后的真实分配速度
+                    start = std::chrono::high_resolution_clock::now();
+                    for (int i = 0; i < alloc_num; ++i) {
+                        Bullet* b = g_pool.allocate(id_);
+                        g_pool.deallocate(b);
+                    }
+                    end = std::chrono::high_resolution_clock::now();
+                    pure_pool_time_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+                }
+
+                // 执行真实任务：使用内存池 (含 Manager 锁和队列操作)
+                auto p_start = std::chrono::high_resolution_clock::now();
                 for (int i = 0; i < alloc_num; ++i) {
                     Bullet* b = g_pool.allocate(id_); // 使用 MemoryPool 的参数转发
                     g_manager.add(b);
                 }
+                auto p_end = std::chrono::high_resolution_clock::now();
+                pool_time_us = std::chrono::duration_cast<std::chrono::microseconds>(p_end - p_start).count();
                 
-                size_t alloc, free_cnt, used, cap;
-                g_pool.get_stats(alloc, free_cnt, used, cap);
-                std::string msg = "[Thread " + std::to_string(id_) + "] Fired " + std::to_string(alloc_num) + " bullets. (Pool Used: " + std::to_string(used) + "/" + std::to_string(cap) + ")";
-                log(msg);
+                if (g_debug_mode) {
+                    std::string msg = "[Debug] Thread " + std::to_string(id_) 
+                                    + " | Count: " + std::to_string(alloc_num)
+                                    + " | Ordinary: " + std::to_string(ordinary_time_us) + " us"
+                                    + " | Pure Pool: " + std::to_string(pure_pool_time_us) + " us"
+                                    + " | Real(incl. Logic): " + std::to_string(pool_time_us) + " us";
+                    log(msg);
+                } else {
+                    size_t alloc, free_cnt, used, cap;
+                    g_pool.get_stats(alloc, free_cnt, used, cap);
+                    std::string msg = "[Thread " + std::to_string(id_) + "] Fired " + std::to_string(alloc_num) + " bullets. (Pool Used: " + std::to_string(used) + "/" + std::to_string(cap) + ")";
+                    log(msg);
+                }
             }
         });
     }
@@ -176,6 +217,7 @@ int main() {
     log("  <ThreadID> <Count>  : Thread ID fires Count bullets (e.g., '1 5')");
     log("  clear               : Force recycle all active bullets");
     log("  status              : Show pool stats");
+    log("  debug               : Toggle debug mode (benchmark info)");
     log("  exit                : Quit");
     log("===========================================");
 
@@ -183,6 +225,13 @@ int main() {
     while (std::getline(std::cin, line)) {
         if (line == "exit") break;
         if (line.empty()) continue;
+
+        if (line == "debug") {
+            bool current = g_debug_mode;
+            g_debug_mode = !current;
+            log(std::string("[System] Debug mode ") + (g_debug_mode ? "ENABLED" : "DISABLED"));
+            continue;
+        }
 
         if (line == "clear") {
             g_manager.clear_all();
