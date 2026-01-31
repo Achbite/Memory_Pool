@@ -12,13 +12,17 @@
 #include <map>
 #include <cstring>
 
-// define MEMORY_POOL_PREHEAT to enable page zeroing on allocation
+// 可选预热内存页，减少首次访问的缺页中断
 // #define MEMORY_POOL_PREHEAT
 
 // 跨平台内存对齐分配器
 // 封装 _aligned_malloc (Windows) 和 posix_memalign (Linux/Unix)
+// 作用：提供统一的跨平台内存对齐分配接口。
 class AlignedAllocator {
 public:
+    // 分配对齐内存
+    // size: 需要分配的内存大小
+    // alignment: 对齐字节数
     static void* allocate(size_t size, size_t alignment) {
 #ifdef _WIN32
         return _aligned_malloc(size, alignment);
@@ -31,6 +35,8 @@ public:
 #endif
     }
     
+    // 释放对齐内存
+    // ptr: 内存指针
     static void deallocate(void* ptr) {
 #ifdef _WIN32
         _aligned_free(ptr);
@@ -45,13 +51,13 @@ public:
 // 当对象空闲时，这块内存本身并不存储数据，而是被解释为指向下一个空闲块的指针。
 // 这样就不需要额外的内存来维护空闲链表。
 struct FreeNode {
-    FreeNode* next;
+    FreeNode* next; // 指向下一个空闲节点
 };
 
 // 线程局部缓存 (Thread-Local Allocation Buffer - TLAB)
 // 核心优化组件：通过 TLS 减少多线程对全局锁的竞争，实现无锁的快速分配与释放。
 struct ThreadCache {
-    FreeNode* free_list = nullptr;
+    FreeNode* free_list = nullptr; // 本地空闲链表头
     size_t count = 0;              // 当前缓存对象数
     
     // ----------- 调优参数 -----------
@@ -67,18 +73,22 @@ struct ThreadCache {
     // 引入延迟归还机制，避免 count 在 MAX_CACHE 附近波动时引发频繁的锁操作 (Thrashing)。
     // 只有当 pending_return_count 累积到 RETURN_THRESHOLD 时，才真正执行系统级归还。
     
-    size_t pending_return_count = 0;      
-    const size_t RETURN_THRESHOLD = 1024; 
+    size_t pending_return_count = 0;       // 累积的待归还计数
+    const size_t RETURN_THRESHOLD = 1024;  // 触发归还的阈值
 };
 
 // 内存页：管理一块连续的堆内存
+// 作用：MemoryPool 的基础存储单元，每次扩容分配一个 Page
 struct Page {
-    void* memory;    
+    void* memory;    // 内存块首地址
     size_t size;     // 单个对象大小 (含对齐)
-    size_t capacity; // 容量
-    std::chrono::steady_clock::time_point last_active; 
-    size_t active_count = 0; // GC 标记阶段使用
+    size_t capacity; // 容量（对象个数）
+    std::chrono::steady_clock::time_point last_active; // 最后活跃时间，用于GC策略
+    size_t active_count = 0; // GC 标记阶段使用，记录当前页中被使用的对象数
 
+    // 构造函数：分配大块内存
+    // cap: 容量
+    // obj_size: 对象大小
     Page(size_t cap, size_t obj_size) : size(obj_size), capacity(cap) {
         // 计算对齐：至少为 void* 大小，或者是 max_align_t
         size_t alignment = alignof(std::max_align_t); 
@@ -102,6 +112,7 @@ struct Page {
         if (memory) AlignedAllocator::deallocate(memory);
     }
 
+    // 检查指针是否属于当前页的内存范围
     bool contains(void* ptr) const {
         char* start = static_cast<char*>(memory);
         char* end = start + (capacity * size);
@@ -115,20 +126,25 @@ private:
     // 确保对象大小至少能容纳一个指针，用于构建空闲链表
     static_assert(sizeof(T) >= sizeof(FreeNode), "Object too small for intrusive list");
 
-    std::mutex mtx_;
+    std::mutex mtx_;                // 全局锁，保护 pages_ 和 free_list_
     std::vector<Page*> pages_;      // 持有所有申请的大块内存页
-    FreeNode* free_list_ = nullptr; // 空闲链表头指针，指向当前可用的内存块
+    FreeNode* free_list_ = nullptr; // 全局空闲链表头指针，指向当前可用的内存块
 
-    std::atomic<size_t> total_capacity_{0};
-    std::atomic<size_t> used_count_{0};
-    std::atomic<size_t> alloc_count_{0};
-    std::atomic<size_t> free_count_{0};
+    // 原子计数器，用于统计和监控
+    std::atomic<size_t> total_capacity_{0}; // 总容量
+    std::atomic<size_t> used_count_{0};     // 当前使用的对象数
+    std::atomic<size_t> alloc_count_{0};    // 累计分配次数
+    std::atomic<size_t> free_count_{0};     // 累计释放次数
+    std::atomic<size_t> cache_hits_{0};      // 缓存命中次数
+    std::atomic<size_t> cache_misses_{0};    // 缓存未命中（需访问全局池）次数
 
+    // 线程局部存储 (TLS) 的缓存
     static thread_local ThreadCache t_cache_;
 
-    const size_t INITIAL_SIZE = 5120;
-    const size_t GROW_SIZE = 5120; // 每次动态扩容的数量
+    const size_t INITIAL_SIZE = 5120; // 初始分配大小
+    const size_t GROW_SIZE = 5120;    // 每次动态扩容的数量
     
+    // 维护相关的参数
     size_t min_capacity_ = 5000;
     size_t max_capacity_ = 1000000;
     size_t long_term_peak_ = 0; // 长期观察到的峰值使用量
@@ -227,6 +243,7 @@ public:
         while (t_cache_.free_list && batch_size < count) {
             FreeNode* node = t_cache_.free_list;
             t_cache_.free_list = node->next;
+            t_cache_.count--; // 立即更新本地计数
             
             if (!batch_head) {
                 batch_head = batch_tail = node;
@@ -244,7 +261,6 @@ public:
             free_list_ = batch_head;
             
             used_count_ -= batch_size;
-            t_cache_.count -= batch_size;
 
             // 触发 GC 检查
             maintain_ops_counter_++;
@@ -264,6 +280,7 @@ public:
     }
 
     // 维护策略：根据历史负载动态调整容量
+    // 功能：更新长期峰值，并根据需要触发 shrink
     void maintain() {
         // 1. 峰值追踪与衰减 (Peak Decay)
         size_t current_usage = used_count_;
@@ -287,6 +304,7 @@ public:
     }
 
     // 垃圾回收 (GC)：释放未使用的 Page
+    // target_capacity: 目标保留容量，多余的空闲页将被释放
     void shrink(size_t target_capacity) {
         // 1. 标记活跃度 (Mark)
         // 遍历空闲链表确定每个 Page 的实际占用情况
@@ -314,9 +332,14 @@ public:
         // 2. 筛选 (Sweep Plan)
         std::vector<Page*> pages_to_keep;
         std::vector<Page*> pages_to_free;
+        
+        auto now = std::chrono::steady_clock::now();
 
         for (auto page : pages_) {
-            if (page->active_count == 0 && (total_capacity_ - page->capacity) >= target_capacity) {
+            // 优化：增加时间检查，避免释放最近创建或活跃的页
+            bool recently_active = (now - page->last_active < std::chrono::seconds(5)); // 5秒保护期
+
+            if (page->active_count == 0 && !recently_active && (total_capacity_ - page->capacity) >= target_capacity) {
                 pages_to_free.push_back(page);
                 total_capacity_ -= page->capacity;
             } else {
@@ -363,8 +386,11 @@ public:
     T* allocate(Args&&... args) {
         // 快速路径：TLAB 分配
         if (!t_cache_.free_list) {
+            cache_misses_++;
             fetch_from_global(t_cache_.BATCH_SIZE);
             if (!t_cache_.free_list) throw std::bad_alloc();
+        } else {
+            cache_hits_++;
         }
 
         FreeNode* node = t_cache_.free_list;
@@ -378,10 +404,11 @@ public:
     }
 
     // 归还内存
+    // ptr: 指向要释放的对象的指针
     void deallocate(T* ptr) {
         if (!ptr) return;
 
-        ptr->~T();
+        ptr->~T(); // 显式调用析构函数
 
         // 快速路径：归还至 TLAB (无锁)
         FreeNode* node = reinterpret_cast<FreeNode*>(ptr);
@@ -417,6 +444,65 @@ public:
             }
         }
         return false;
+    }
+
+    // 预热内存池
+    void warmup(size_t count) {
+        // 临时分配一批对象以触发扩容和缓存填充
+        std::vector<T*> temp;
+        temp.reserve(count);
+        
+        for (size_t i = 0; i < count; ++i) {
+            try {
+                temp.push_back(allocate());
+            } catch (...) {
+                break;
+            }
+        }
+        
+        for (auto ptr : temp) {
+            deallocate(ptr);
+        }
+        
+        // 归还到全局池，供其他线程使用
+        flush_thread_cache();
+    }
+
+    // 线程安全的调试信息转储
+    void dump_debug_info() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        
+        std::cout << "=== Memory Pool Debug Info ===\n";
+        std::cout << "Total Capacity: " << total_capacity_.load() << "\n";
+        std::cout << "Used Count: " << used_count_.load() << "\n";
+        std::cout << "Alloc Count: " << alloc_count_.load() << "\n";
+        std::cout << "Free Count: " << free_count_.load() << "\n";
+        std::cout << "Cache Hits: " << cache_hits_.load() << "\n";
+        std::cout << "Cache Misses: " << cache_misses_.load() << "\n";
+        
+        std::cout << "Pages: " << pages_.size() << "\n";
+        // 简单的页统计，暂时移除未使用变量 empty_pages 以消除警告
+        // size_t empty_pages = 0;
+        for (auto page : pages_) {
+             // 注意：这里没有重新计算 active_count，只是快照
+             if (now() - page->last_active < std::chrono::seconds(5)) {
+                 // recently active
+             }
+        }
+        
+        // 统计全局空闲链表长度 (O(N))
+        size_t global_free_nodes = 0;
+        FreeNode* curr = free_list_;
+        while (curr) {
+            global_free_nodes++;
+            curr = curr->next;
+        }
+        std::cout << "Global Free List Nodes: " << global_free_nodes << "\n";
+        std::cout << "==============================\n";
+    }
+    
+    std::chrono::steady_clock::time_point now() {
+        return std::chrono::steady_clock::now();
     }
 
     //获取统计信息
