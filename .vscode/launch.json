@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug MemoryPool (Basic)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/MemoryPool.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "preLaunchTask": "build-debug-simple",
+            "logging": {
+                "moduleLoad": false,
+                "trace": false
+            }
+        },
+        {
+            "name": "Debug MemoryPool (Alternative)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/MemoryPool.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "preLaunchTask": "build-debug-simple"
+        }
+    ]
+}

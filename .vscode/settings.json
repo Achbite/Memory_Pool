@@ -1,0 +1,16 @@
+{
+    "C_Cpp.default.configurationProvider": "ms-vscode.cpptools",
+    "files.associations": {
+        "*.hpp": "cpp",
+        "*.h": "cpp"
+    },
+    "C_Cpp.default.cppStandard": "c++11",
+    "C_Cpp.default.intelliSenseMode": "gcc-x64",
+    "C_Cpp.errorSquiggles": "enabled",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+        "source.fixAll": true
+    },
+    "debug.onTaskErrors": "showErrors",
+    "cmake.configureOnOpen": false
+}
