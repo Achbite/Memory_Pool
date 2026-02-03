@@ -1,4 +1,4 @@
 /MemoryPool.exe
-/CMakeLists.txt
-/Makefile
-/build.bat
+CMakeLists.txt
+Makefile
+build.bat
