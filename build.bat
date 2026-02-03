@@ -1,6 +1,32 @@
 @echo off
 rem Memory Pool Build Script
-set CXX=D:\Dev-Cpp\MinGW64\bin\g++.exe
+
+rem 自动检测编译器路径
+set CXX=
+if not "%CXX%"=="" (
+    rem 使用用户指定的CXX环境变量
+) else if exist "%ProgramFiles%\mingw64\bin\g++.exe" (
+    set CXX=%ProgramFiles%\mingw64\bin\g++.exe
+) else if exist "C:\msys64\mingw64\bin\g++.exe" (
+    set CXX=C:\msys64\mingw64\bin\g++.exe
+) else if exist "D:\MSYS2\mingw64\bin\g++.exe" (
+    set CXX=D:\MSYS2\mingw64\bin\g++.exe
+) else (
+    rem 尝试使用PATH环境变量中的g++
+    for /f "delims=" %%i in ('where g++ 2^>nul') do (
+        set CXX=%%i
+        goto :found_compiler
+    )
+    echo [Error] No C++ compiler found!
+    echo Please install MinGW-w64 or set CXX environment variable
+    echo Examples:
+    echo   set CXX=C:\path\to\g++.exe
+    echo   set CXX=D:\MSYS2\mingw64\bin\g++.exe
+    pause
+    exit /b 1
+)
+
+:found_compiler
 set SRCS=src\main.cpp
 set TARGET=MemoryPool.exe
 set FLAGS=-std=c++11 -Iinclude -O2 -Wall
@@ -10,12 +36,6 @@ echo Compiler: %CXX%
 echo Source:   %SRCS%
 echo Output:   %TARGET%
 echo ==========================================
-
-if not exist "%CXX%" (
-    echo [Error] Compiler not found at: %CXX%
-    pause
-    exit /b 1
-)
 
 echo Building...
 "%CXX%" %FLAGS% -o %TARGET% %SRCS%

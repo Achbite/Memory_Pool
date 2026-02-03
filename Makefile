@@ -1,8 +1,19 @@
 # Makefile for Memory Pool Project
 
-# 编译器
-# 使用用户指定的绝对路径
-CXX = "D:/Dev-Cpp/MinGW64/bin/g++.exe"
+# 编译器 - 自动检测或使用环境变量
+ifdef CXX
+    # 使用用户设置的CXX环境变量
+else ifneq (,$(wildcard /mingw64/bin/g++.exe))
+    CXX = /mingw64/bin/g++.exe
+else ifneq (,$(wildcard C:/msys64/mingw64/bin/g++.exe))
+    CXX = C:/msys64/mingw64/bin/g++.exe
+else ifneq (,$(wildcard D:/MSYS2/mingw64/bin/g++.exe))
+    CXX = D:/MSYS2/mingw64/bin/g++.exe
+else ifneq (,$(shell which g++ 2>/dev/null))
+    CXX = $(shell which g++)
+else
+    $(error No C++ compiler found! Please install MinGW-w64 or set CXX environment variable)
+endif
 
 # 编译选项
 # -std=c++11: 使用 C++11 标准 (兼容旧版 GCC)
