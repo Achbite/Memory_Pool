@@ -165,6 +165,25 @@ pool.deallocate(object);
 
 因此，系统 `new` 的性能不能简单理解为“每次都向操作系统申请内存”。现代运行时分配器通常包含线程本地缓存、size class、arena/tcache、批量向中心堆申请等优化；小对象反复分配释放时，大量操作可能只在用户态缓存中完成，不会每次触发系统调用。这也是当前内存池需要尽量压短 fast path、减少哈希查找和原子统计开销的原因。
 
+### 为什么当前压测里内存池有时比系统分配慢？
+
+当前日志里的 `Ordinary`、`Pure Pool` 和 `Real(incl. Logic)` 不是完全相同的成本口径。
+
+`Ordinary` 使用系统 `new/delete` 路径，但现代运行时分配器通常已经包含线程本地缓存、size class、arena/tcache 等优化。小对象在同一线程内反复申请释放时，很多操作不会真正进入系统调用，因此系统分配并不等于“每次都向操作系统申请内存”。
+
+`Pure Pool` 当前会执行 `allocate + 对象写入 + vector 保存 + 再次读取 + deallocate_batch_to_global`。其中 `deallocate_batch_to_global()` 会绕过线程本地缓存，直接把节点归还全局空闲链表，下一批再从全局池批量取回。这会引入全局锁、链表搬运和缓存局部性下降，因此它更像是在测试全局 free list 搬运能力，而不是线程本地 fast path。
+
+`ManagedLifecycle` 场景还会把对象持续交给 `Manager` 持有，活跃对象会从几十万累计到两百万级别；而 `Ordinary` 每批只是临时申请后立即释放，并不会累计同等规模的活跃对象。因此 `ManagedLifecycle` 的 `Real(incl. Logic)` 不能直接和 `Ordinary` 视为同一负载对比。
+
+更接近当前内存池理想使用方式的是 `ImmediateRelease` 场景中的 `Real(incl. Logic)`：对象由 worker 在线程内申请，并通过 `deallocate()` 释放回当前线程的 `ThreadCache`。当前日志中这一路径通常快于 `Ordinary`，说明内存池在线程本地缓存命中时是有效的。
+
+因此，当前结论不是“内存池一定比系统分配慢”，而是：
+
+- 线程本地申请、线程本地释放时，内存池可以更快。
+- 强制批量归还全局池时，内存池会输给系统 allocator 的成熟线程本地缓存。
+- 连续持有大量对象时，扩容、全局链表、Manager 管理和调试日志都会影响性能。
+- 若要做严格 allocator 对比，应新增 allocator-only benchmark，避免混入对象访问、Manager、日志和全局调试统计。
+
 ### 为什么释放对象后统计中的 Used Count 不一定立即归零？
 
 线程局部缓存会暂存一批空闲节点，释放对象后节点可能仍停留在当前线程的 `ThreadCache` 中。需要调用 `flush_thread_cache()`，或通过 `clear` 命令通知工作线程刷新本地缓存后，统计值才会进一步回落。
