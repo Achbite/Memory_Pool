@@ -1,11 +1,11 @@
-build/
-CMakeFiles/
+.git
+build
+CMakeFiles
 CMakeCache.txt
 cmake_install.cmake
 CTestTestfile.cmake
-Testing/
+Testing
 MemoryPool.exe
 memory_pool_demo
 memory_pool_smoke_test
 _check_output.txt
-log/

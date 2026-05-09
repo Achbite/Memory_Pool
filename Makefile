@@ -1,40 +1,25 @@
 # Makefile for Memory Pool Project
 
-# 编译器 - 自动检测或使用环境变量
-ifdef CXX
-    # 使用用户设置的CXX环境变量
-else ifneq (,$(wildcard /mingw64/bin/g++.exe))
-    CXX = /mingw64/bin/g++.exe
-else ifneq (,$(wildcard C:/msys64/mingw64/bin/g++.exe))
-    CXX = C:/msys64/mingw64/bin/g++.exe
-else ifneq (,$(wildcard D:/MSYS2/mingw64/bin/g++.exe))
-    CXX = D:/MSYS2/mingw64/bin/g++.exe
-else ifneq (,$(shell which g++ 2>/dev/null))
-    CXX = $(shell which g++)
-else
-    $(error No C++ compiler found! Please install MinGW-w64 or set CXX environment variable)
-endif
+IMAGE_NAME := memory-pool-cpp17
+CONTAINER_WORKDIR := /workspace
+BUILD_DIR := build
 
-# 编译选项
-# -std=c++11: 使用 C++11 标准 (兼容旧版 GCC)
-# -Iinclude: 添加头文件搜索路径
-# -O2: 开启二级优化
-# -Wall: 开启所有警告
-CXXFLAGS = -std=c++11 -Iinclude -O2 -Wall
+.PHONY: image build test run shell clean
 
-# 目标可执行文件名称
-TARGET = MemoryPool.exe
+image:
+	docker build -t $(IMAGE_NAME) .
 
-# 源文件列表
-SRCS = src/main.cpp
+build: image
+	docker run --rm -v $(CURDIR):$(CONTAINER_WORKDIR) -w $(CONTAINER_WORKDIR) $(IMAGE_NAME) bash ./build.sh
 
-# 默认构建目标
-all: $(TARGET)
+test: build
+	docker run --rm -v $(CURDIR):$(CONTAINER_WORKDIR) -w $(CONTAINER_WORKDIR) $(IMAGE_NAME) ctest --test-dir $(BUILD_DIR) --output-on-failure
 
-# 构建规则
-$(TARGET): $(SRCS)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRCS)
+run: build
+	docker run --rm -it -v $(CURDIR):$(CONTAINER_WORKDIR) -w $(CONTAINER_WORKDIR) $(IMAGE_NAME) bash ./start.sh
 
-# 清理规则 (适配 Windows CMD)
+shell: image
+	docker run --rm -it -v $(CURDIR):$(CONTAINER_WORKDIR) -w $(CONTAINER_WORKDIR) $(IMAGE_NAME) bash -lc 'bash ./build.sh && exec bash'
+
 clean:
-	@if exist $(TARGET) del $(TARGET)
+	rm -rf $(BUILD_DIR)

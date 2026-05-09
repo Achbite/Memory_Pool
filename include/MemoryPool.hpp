@@ -1,23 +1,39 @@
 #pragma once
-#include <vector>
-#include <mutex>
-#include <atomic>
-#include <iostream>
-#include <thread>
-#include <vector>
-#include <chrono>
-#include <memory>
-#include <cstddef>
+
 #include <algorithm>
-#include <map>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+#include <map>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 // 可选预热内存页，减少首次访问的缺页中断
 // #define MEMORY_POOL_PREHEAT
 
-// 跨平台内存对齐分配器
-// 封装 _aligned_malloc (Windows) 和 posix_memalign (Linux/Unix)
-// 作用：提供统一的跨平台内存对齐分配接口。
+namespace memory_pool_detail {
+
+inline std::uintptr_t address_value(const void* ptr) {
+    return reinterpret_cast<std::uintptr_t>(ptr);
+}
+
+} // namespace memory_pool_detail
+
+// Linux 对齐内存分配器
+// 作用：基于 posix_memalign 提供 Docker/Linux 环境下的对齐分配接口。
 class AlignedAllocator {
 public:
     // 分配对齐内存
@@ -25,7 +41,11 @@ public:
     // alignment: 对齐字节数
     static void* allocate(size_t size, size_t alignment) {
 #ifdef _WIN32
-        return _aligned_malloc(size, alignment);
+        void* ptr = _aligned_malloc(size, alignment);
+        if (!ptr) {
+            throw std::bad_alloc();
+        }
+        return ptr;
 #else
         void* ptr = nullptr;
         if (posix_memalign(&ptr, alignment, size) != 0) {
@@ -41,7 +61,7 @@ public:
 #ifdef _WIN32
         _aligned_free(ptr);
 #else
-        free(ptr);
+        std::free(ptr);
 #endif
     }
 };
@@ -59,6 +79,19 @@ struct FreeNode {
 struct ThreadCache {
     FreeNode* free_list = nullptr; // 本地空闲链表头
     size_t count = 0;              // 当前缓存对象数
+    std::string thread_label;      // 调试标签，用于区分业务线程
+    size_t alloc_count = 0;        // 当前线程累计分配次数
+    size_t free_count = 0;         // 当前线程累计释放次数
+    size_t cache_hits = 0;         // 当前线程本地缓存命中次数
+    size_t cache_misses = 0;       // 当前线程访问全局池次数
+    size_t global_fetch_count = 0; // 当前线程从全局池批量获取次数
+    size_t global_fetch_nodes = 0; // 当前线程从全局池获取的节点总数
+    size_t global_return_count = 0; // 当前线程向全局池批量归还次数
+    size_t global_return_nodes = 0; // 当前线程向全局池归还的节点总数
+    size_t published_alloc_count = 0; // 已汇总到全局统计的分配次数
+    size_t published_free_count = 0;  // 已汇总到全局统计的释放次数
+    size_t published_cache_hits = 0;  // 已汇总到全局统计的本地命中次数
+    size_t published_cache_misses = 0; // 已汇总到全局统计的全局兜底次数
     
     // ----------- 调优参数 -----------
     
@@ -69,12 +102,32 @@ struct ThreadCache {
     // 缓存软上限：当本地缓存超过此阈值，触发归还判定逻辑。
     const size_t MAX_CACHE = 4096;
 
+    // 缓存回落目标：触发批量归还后，本地缓存保留到该数量，避免大批量释放滞留在线程局部池。
+    const size_t TARGET_CACHE = 2048;
+    
     // ----------- 迟滞策略 (Hysteresis Strategy) -----------
     // 引入延迟归还机制，避免 count 在 MAX_CACHE 附近波动时引发频繁的锁操作 (Thrashing)。
     // 只有当 pending_return_count 累积到 RETURN_THRESHOLD 时，才真正执行系统级归还。
     
     size_t pending_return_count = 0;       // 累积的待归还计数
     const size_t RETURN_THRESHOLD = 1024;  // 触发归还的阈值
+};
+
+// 线程局部池调试快照
+// 作用：对外暴露每个线程局部缓存的占用与全局池交互情况。
+struct ThreadCacheDebugInfo {
+    std::thread::id thread_id;      // 标准库线程ID
+    std::string thread_label;       // 业务线程标签
+    size_t local_cached_nodes = 0;  // 局部池当前缓存节点数
+    size_t pending_return_nodes = 0; // 等待触发批量归还的节点计数
+    size_t alloc_count = 0;         // 当前线程累计分配次数
+    size_t free_count = 0;          // 当前线程累计释放次数
+    size_t cache_hits = 0;          // 当前线程本地命中次数
+    size_t cache_misses = 0;        // 当前线程全局兜底次数
+    size_t global_fetch_count = 0;  // 当前线程全局获取批次数
+    size_t global_fetch_nodes = 0;  // 当前线程全局获取节点数
+    size_t global_return_count = 0; // 当前线程全局归还批次数
+    size_t global_return_nodes = 0; // 当前线程全局归还节点数
 };
 
 // 内存页：管理一块连续的堆内存
@@ -114,9 +167,10 @@ struct Page {
 
     // 检查指针是否属于当前页的内存范围
     bool contains(void* ptr) const {
-        char* start = static_cast<char*>(memory);
-        char* end = start + (capacity * size);
-        return ptr >= start && ptr < end;
+        const auto start = memory_pool_detail::address_value(memory);
+        const auto end = start + (capacity * size);
+        const auto current = memory_pool_detail::address_value(ptr);
+        return current >= start && current < end;
     }
 };
 
@@ -138,8 +192,14 @@ private:
     std::atomic<size_t> cache_hits_{0};      // 缓存命中次数
     std::atomic<size_t> cache_misses_{0};    // 缓存未命中（需访问全局池）次数
 
+    // 线程局部池统计快照
+    mutable std::mutex thread_stats_mtx_; // 保护线程统计快照
+    std::map<std::thread::id, ThreadCacheDebugInfo> thread_cache_stats_; // 每个线程最近一次发布的局部池状态
+
     // 线程局部存储 (TLS) 的缓存
-    static thread_local ThreadCache t_cache_;
+    static thread_local std::unordered_map<MemoryPool<T>*, ThreadCache>* t_caches_;
+    static thread_local MemoryPool<T>* t_last_pool_;
+    static thread_local ThreadCache* t_last_cache_;
 
     const size_t INITIAL_SIZE = 5120; // 初始分配大小
     const size_t GROW_SIZE = 5120;    // 每次动态扩容的数量
@@ -151,12 +211,83 @@ private:
     size_t maintain_ops_counter_ = 0; // 计数器，用于触发维护
     const size_t MAINTAIN_INTERVAL = 1000; // 每1000次deallocate检查一次
 
+    // 获取当前线程在当前池实例上的局部缓存
+    ThreadCache& thread_cache() {
+        if (t_last_pool_ == this && t_last_cache_) {
+            return *t_last_cache_;
+        }
+
+        if (!t_caches_) {
+            t_caches_ = new std::unordered_map<MemoryPool<T>*, ThreadCache>();
+        }
+
+        ThreadCache& cache = (*t_caches_)[this];
+        t_last_pool_ = this;
+        t_last_cache_ = &cache;
+        return cache;
+    }
+
+    // 批量发布当前线程的统计计数
+    void publish_thread_cache_counters(ThreadCache& cache) {
+        const size_t alloc_delta = cache.alloc_count - cache.published_alloc_count;
+        const size_t free_delta = cache.free_count - cache.published_free_count;
+        const size_t hit_delta = cache.cache_hits - cache.published_cache_hits;
+        const size_t miss_delta = cache.cache_misses - cache.published_cache_misses;
+
+        if (alloc_delta > 0) {
+            alloc_count_.fetch_add(alloc_delta, std::memory_order_relaxed);
+            cache.published_alloc_count = cache.alloc_count;
+        }
+        if (free_delta > 0) {
+            free_count_.fetch_add(free_delta, std::memory_order_relaxed);
+            cache.published_free_count = cache.free_count;
+        }
+        if (hit_delta > 0) {
+            cache_hits_.fetch_add(hit_delta, std::memory_order_relaxed);
+            cache.published_cache_hits = cache.cache_hits;
+        }
+        if (miss_delta > 0) {
+            cache_misses_.fetch_add(miss_delta, std::memory_order_relaxed);
+            cache.published_cache_misses = cache.cache_misses;
+        }
+    }
+
+    // 发布当前线程局部池快照
+    void publish_thread_cache_stats(ThreadCache& cache) {
+        publish_thread_cache_counters(cache);
+
+        ThreadCacheDebugInfo snapshot;
+        snapshot.thread_id = std::this_thread::get_id();
+        snapshot.thread_label = cache.thread_label;
+        snapshot.local_cached_nodes = cache.count;
+        snapshot.pending_return_nodes = cache.pending_return_count;
+        snapshot.alloc_count = cache.alloc_count;
+        snapshot.free_count = cache.free_count;
+        snapshot.cache_hits = cache.cache_hits;
+        snapshot.cache_misses = cache.cache_misses;
+        snapshot.global_fetch_count = cache.global_fetch_count;
+        snapshot.global_fetch_nodes = cache.global_fetch_nodes;
+        snapshot.global_return_count = cache.global_return_count;
+        snapshot.global_return_nodes = cache.global_return_nodes;
+
+        std::lock_guard<std::mutex> lock(thread_stats_mtx_);
+        thread_cache_stats_[snapshot.thread_id] = snapshot;
+    }
+
 public:
     MemoryPool() {
         expand(INITIAL_SIZE);
     }
 
     ~MemoryPool() {
+        flush_thread_cache();
+        if (t_caches_) {
+            t_caches_->erase(this);
+        }
+        if (t_last_pool_ == this) {
+            t_last_pool_ = nullptr;
+            t_last_cache_ = nullptr;
+        }
         for (auto page : pages_) delete page;
         pages_.clear();
     }
@@ -185,7 +316,7 @@ public:
         // 保持 Page 列表有序，便于二分查找
         auto it = std::upper_bound(pages_.begin(), pages_.end(), raw_ptr, 
             [](const Page* a, const Page* b) {
-                return a->memory < b->memory;
+                return memory_pool_detail::address_value(a->memory) < memory_pool_detail::address_value(b->memory);
             });
         
         pages_.insert(it, raw_ptr);
@@ -208,42 +339,56 @@ public:
 
     // 从全局池获取一批节点到 TLAB
     size_t fetch_from_global(size_t count) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        
-        // 如果全局池空了，先扩容
-        if (!free_list_) {
-            expand(std::max(count, GROW_SIZE));
+        ThreadCache& cache = thread_cache();
+        size_t fetched = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            
+            // 如果全局池空了，先扩容
+            if (!free_list_) {
+                expand(std::max(count, GROW_SIZE));
+            }
+
+            // 链表摘除操作 (O(N) where N=count)
+            while (free_list_ && fetched < count) {
+                FreeNode* node = free_list_;
+                free_list_ = node->next;
+                
+                node->next = cache.free_list;
+                cache.free_list = node;
+                
+                fetched++;
+                cache.count++;
+            }
+
+            used_count_ += fetched;
         }
 
-        size_t fetched = 0;
-        // 链表摘除操作 (O(N) where N=count)
-        while (free_list_ && fetched < count) {
-            FreeNode* node = free_list_;
-            free_list_ = node->next;
-            
-            node->next = t_cache_.free_list;
-            t_cache_.free_list = node;
-            
-            fetched++;
-            used_count_++;
-        }
+        cache.global_fetch_count++;
+        cache.global_fetch_nodes += fetched;
+        publish_thread_cache_stats(cache);
         return fetched;
     }
 
     // 将 TLAB 中的节点归还全局池
     // 优化：先在本地构建链表，再加锁一次性合并，最小化临界区时间。
     void return_to_global(size_t count) {
-        if (count == 0 || !t_cache_.free_list) return;
+        ThreadCache& cache = thread_cache();
+        if (count == 0 || !cache.free_list) {
+            publish_thread_cache_stats(cache);
+            return;
+        }
 
         // Phase 1: Local list building (Lock-free)
         FreeNode* batch_head = nullptr;
         FreeNode* batch_tail = nullptr;
         size_t batch_size = 0;
         
-        while (t_cache_.free_list && batch_size < count) {
-            FreeNode* node = t_cache_.free_list;
-            t_cache_.free_list = node->next;
-            t_cache_.count--; // 立即更新本地计数
+        while (cache.free_list && batch_size < count) {
+            FreeNode* node = cache.free_list;
+            cache.free_list = node->next;
+            cache.count--; // 立即更新本地计数
             
             if (!batch_head) {
                 batch_head = batch_tail = node;
@@ -269,14 +414,26 @@ public:
                 maintain();
             }
         }
+
+        cache.global_return_count++;
+        cache.global_return_nodes += batch_size;
+        publish_thread_cache_stats(cache);
     }
 
     // 建议在线程结束时调用，清空缓存
     void flush_thread_cache() {
-        if (!t_cache_.free_list) return;
-        return_to_global(t_cache_.count);
-        t_cache_.count = 0;
-        t_cache_.free_list = nullptr;
+        ThreadCache& cache = thread_cache();
+        if (!cache.free_list) {
+            cache.count = 0;
+            cache.pending_return_count = 0;
+            publish_thread_cache_stats(cache);
+            return;
+        }
+        return_to_global(cache.count);
+        cache.count = 0;
+        cache.free_list = nullptr;
+        cache.pending_return_count = 0;
+        publish_thread_cache_stats(cache);
     }
 
     // 维护策略：根据历史负载动态调整容量
@@ -317,7 +474,7 @@ public:
             // 二分查找定位所属 Page
             auto it = std::upper_bound(pages_.begin(), pages_.end(), curr, 
                 [](const void* addr, const Page* page) {
-                    return addr < page->memory;
+                    return memory_pool_detail::address_value(addr) < memory_pool_detail::address_value(page->memory);
                 });
             
             if (it != pages_.begin()) {
@@ -385,20 +542,21 @@ public:
 
     template<typename... Args>
     T* allocate(Args&&... args) {
+        ThreadCache& cache = thread_cache();
+
         // 快速路径：TLAB 分配
-        if (!t_cache_.free_list) {
-            cache_misses_++;
-            fetch_from_global(t_cache_.BATCH_SIZE);
-            if (!t_cache_.free_list) throw std::bad_alloc();
+        if (!cache.free_list) {
+            cache.cache_misses++;
+            fetch_from_global(cache.BATCH_SIZE);
+            if (!cache.free_list) throw std::bad_alloc();
         } else {
-            cache_hits_++;
+            cache.cache_hits++;
         }
 
-        FreeNode* node = t_cache_.free_list;
-        t_cache_.free_list = node->next;
-        t_cache_.count--;
-        
-        alloc_count_++;
+        FreeNode* node = cache.free_list;
+        cache.free_list = node->next;
+        cache.count--;
+        cache.alloc_count++;
 
         // Placement New: 在已分配的内存地址上直接构造对象
         return new (node) T(std::forward<Args>(args)...);
@@ -409,25 +567,79 @@ public:
     void deallocate(T* ptr) {
         if (!ptr) return;
 
+        ThreadCache& cache = thread_cache();
         ptr->~T(); // 显式调用析构函数
 
         // 快速路径：归还至 TLAB (无锁)
         FreeNode* node = reinterpret_cast<FreeNode*>(ptr);
-        node->next = t_cache_.free_list;
-        t_cache_.free_list = node;
-        t_cache_.count++;
-        
-        free_count_++;
+        node->next = cache.free_list;
+        cache.free_list = node;
+        cache.count++;
+        cache.free_count++;
 
-        // 慢速路径：检查是否触发归还 (Hysteresis Check)
-        t_cache_.pending_return_count++;
+        // 慢速路径：大批量释放时将多余节点一次性归还全局池，避免释放线程长期囤积缓存。
+        cache.pending_return_count++;
 
-        if (t_cache_.count > t_cache_.MAX_CACHE && 
-            t_cache_.pending_return_count >= t_cache_.RETURN_THRESHOLD) {
-            
-            return_to_global(t_cache_.BATCH_SIZE);
-            t_cache_.pending_return_count = 0;
+        if (cache.count > cache.MAX_CACHE && 
+            cache.pending_return_count >= cache.RETURN_THRESHOLD) {
+            const size_t return_count = cache.count > cache.TARGET_CACHE
+                ? cache.count - cache.TARGET_CACHE
+                : 0;
+            cache.pending_return_count = 0;
+            return_to_global(return_count);
         }
+    }
+
+    // 批量直接归还全局池
+    // 适用于 Manager、Cleaner 等集中回收线程，避免跨线程释放的节点滞留在回收线程局部池。
+    template<typename Iterator>
+    void deallocate_batch_to_global(Iterator begin, Iterator end) {
+        ThreadCache& cache = thread_cache();
+        FreeNode* batch_head = nullptr;
+        FreeNode* batch_tail = nullptr;
+        size_t batch_size = 0;
+
+        // ---- 1. 本地析构并构建待归还链表 ----
+        for (Iterator it = begin; it != end; ++it) {
+            T* ptr = *it;
+            if (!ptr) continue;
+
+            ptr->~T();
+            FreeNode* node = reinterpret_cast<FreeNode*>(ptr);
+            node->next = nullptr;
+
+            if (!batch_head) {
+                batch_head = batch_tail = node;
+            } else {
+                batch_tail->next = node;
+                batch_tail = node;
+            }
+            batch_size++;
+        }
+
+        if (batch_size == 0) {
+            publish_thread_cache_stats(cache);
+            return;
+        }
+
+        // ---- 2. 一次性合并到全局空闲链表 ----
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            batch_tail->next = free_list_;
+            free_list_ = batch_head;
+            used_count_ -= batch_size;
+
+            maintain_ops_counter_++;
+            if (maintain_ops_counter_ >= MAINTAIN_INTERVAL) {
+                maintain_ops_counter_ = 0;
+                maintain();
+            }
+        }
+
+        cache.free_count += batch_size;
+        cache.global_return_count++;
+        cache.global_return_nodes += batch_size;
+        publish_thread_cache_stats(cache);
     }
 
     // 检查指针是否属于本内存池
@@ -437,10 +649,11 @@ public:
             // 计算当前页的地址范围
             // start: 页内存起始地址
             // end: 页内存结束地址
-            char* start = static_cast<char*>(page->memory);
-            char* end = start + (page->capacity * page->size);
+            const auto start = memory_pool_detail::address_value(page->memory);
+            const auto end = start + (page->capacity * page->size);
+            const auto current = memory_pool_detail::address_value(ptr);
             
-            if (reinterpret_cast<char*>(ptr) >= start && reinterpret_cast<char*>(ptr) < end) {
+            if (current >= start && current < end) {
                 return true;
             }
         }
@@ -471,7 +684,21 @@ public:
 
     // 线程安全的调试信息转储
     void dump_debug_info() {
-        std::lock_guard<std::mutex> lock(mtx_);
+        const std::vector<ThreadCacheDebugInfo> thread_snapshots = get_thread_cache_stats();
+        size_t page_count = 0;
+        size_t global_free_nodes = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            page_count = pages_.size();
+
+            // 统计全局空闲链表长度 (O(N))
+            FreeNode* curr = free_list_;
+            while (curr) {
+                global_free_nodes++;
+                curr = curr->next;
+            }
+        }
         
         std::cout << "=== Memory Pool Debug Info ===\n";
         std::cout << "Total Capacity: " << total_capacity_.load() << "\n";
@@ -480,25 +707,28 @@ public:
         std::cout << "Free Count: " << free_count_.load() << "\n";
         std::cout << "Cache Hits: " << cache_hits_.load() << "\n";
         std::cout << "Cache Misses: " << cache_misses_.load() << "\n";
-        
-        std::cout << "Pages: " << pages_.size() << "\n";
-        // 简单的页统计，暂时移除未使用变量 empty_pages 以消除警告
-        // size_t empty_pages = 0;
-        for (auto page : pages_) {
-             // 注意：这里没有重新计算 active_count，只是快照
-             if (now() - page->last_active < std::chrono::seconds(5)) {
-                 // recently active
-             }
-        }
-        
-        // 统计全局空闲链表长度 (O(N))
-        size_t global_free_nodes = 0;
-        FreeNode* curr = free_list_;
-        while (curr) {
-            global_free_nodes++;
-            curr = curr->next;
-        }
+        std::cout << "Pages: " << page_count << "\n";
         std::cout << "Global Free List Nodes: " << global_free_nodes << "\n";
+        std::cout << "Thread Local Pools:\n";
+        if (thread_snapshots.empty()) {
+            std::cout << "  <none>\n";
+        }
+        for (const ThreadCacheDebugInfo& snapshot : thread_snapshots) {
+            const size_t active_delta = snapshot.alloc_count >= snapshot.free_count
+                ? snapshot.alloc_count - snapshot.free_count
+                : 0;
+            const std::string label = snapshot.thread_label.empty() ? "unnamed" : snapshot.thread_label;
+            std::cout << "  Thread " << snapshot.thread_id
+                      << " [" << label << "]"
+                      << " | Local Cached: " << snapshot.local_cached_nodes
+                      << " | Active Delta: " << active_delta
+                      << " | Pending Return: " << snapshot.pending_return_nodes
+                      << " | Alloc/Free: " << snapshot.alloc_count << "/" << snapshot.free_count
+                      << " | Hit/Miss: " << snapshot.cache_hits << "/" << snapshot.cache_misses
+                      << " | Global Fetch: " << snapshot.global_fetch_count << " batches, " << snapshot.global_fetch_nodes << " nodes"
+                      << " | Global Return: " << snapshot.global_return_count << " batches, " << snapshot.global_return_nodes << " nodes"
+                      << "\n";
+        }
         std::cout << "==============================\n";
     }
     
@@ -508,10 +738,40 @@ public:
 
     //获取统计信息
     void get_stats(size_t& out_alloc, size_t& out_free, size_t& out_used, size_t& out_cap) {
+        ThreadCache& cache = thread_cache();
+        publish_thread_cache_counters(cache);
+
         out_alloc = alloc_count_.load();
         out_free = free_count_.load();
         out_used = used_count_.load();
         out_cap = total_capacity_.load();
+    }
+
+    // 设置当前线程的调试标签
+    void set_current_thread_label(const std::string& label) {
+        ThreadCache& cache = thread_cache();
+        cache.thread_label = label;
+        publish_thread_cache_stats(cache);
+    }
+
+    // 获取当前线程局部池快照
+    ThreadCacheDebugInfo get_current_thread_cache_stats() {
+        ThreadCache& cache = thread_cache();
+        publish_thread_cache_stats(cache);
+
+        std::lock_guard<std::mutex> lock(thread_stats_mtx_);
+        return thread_cache_stats_[std::this_thread::get_id()];
+    }
+
+    // 获取全部线程局部池快照
+    std::vector<ThreadCacheDebugInfo> get_thread_cache_stats() const {
+        std::vector<ThreadCacheDebugInfo> snapshots;
+        std::lock_guard<std::mutex> lock(thread_stats_mtx_);
+        snapshots.reserve(thread_cache_stats_.size());
+        for (const auto& item : thread_cache_stats_) {
+            snapshots.push_back(item.second);
+        }
+        return snapshots;
     }
     
     void reset_round_stats() {
@@ -521,4 +781,10 @@ public:
 };
 
 template<typename T>
-thread_local ThreadCache MemoryPool<T>::t_cache_;
+thread_local std::unordered_map<MemoryPool<T>*, ThreadCache>* MemoryPool<T>::t_caches_ = nullptr;
+
+template<typename T>
+thread_local MemoryPool<T>* MemoryPool<T>::t_last_pool_ = nullptr;
+
+template<typename T>
+thread_local ThreadCache* MemoryPool<T>::t_last_cache_ = nullptr;

@@ -1,15 +1,22 @@
-cmake_minimum_required(VERSION 3.10)
-project(MemoryPool)
+cmake_minimum_required(VERSION 3.16)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+project(MemoryPool LANGUAGES CXX)
 
-include_directories(include)
+find_package(Threads REQUIRED)
 
-add_executable(MemoryPool src/main.cpp)
+add_library(memory_pool INTERFACE)
+target_include_directories(memory_pool INTERFACE ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(memory_pool INTERFACE cxx_std_17)
+target_link_libraries(memory_pool INTERFACE Threads::Threads)
 
-if(MSVC)
-    target_compile_options(MemoryPool PRIVATE /W4)
-else()
-    target_compile_options(MemoryPool PRIVATE -Wall -Wextra -pthread)
-endif()
+add_executable(memory_pool_demo src/main.cpp)
+target_link_libraries(memory_pool_demo PRIVATE memory_pool)
+target_compile_options(memory_pool_demo PRIVATE -Wall -Wextra -Wpedantic)
+
+enable_testing()
+
+add_executable(memory_pool_smoke_test tests/memory_pool_smoke_test.cpp)
+target_link_libraries(memory_pool_smoke_test PRIVATE memory_pool)
+target_compile_options(memory_pool_smoke_test PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME memory_pool_smoke_test COMMAND memory_pool_smoke_test)
